@@ -1,0 +1,47 @@
+package hua.dy.image.utils
+
+
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
+import android.util.Log
+import hua.dy.image.BuildConfig
+import hua.dy.image.service.FileExplorerService
+import hua.dy.image.service.IFileExplorerService
+import rikka.shizuku.Shizuku
+import rikka.shizuku.Shizuku.UserServiceArgs
+import splitties.init.appCtx
+
+
+object FileExplorerServiceManager {
+    private const val TAG = "FileExplorerServiceManager"
+    // Bump this value when service-side scan or decode logic changes,
+    // so Shizuku restarts user service with latest implementation.
+    private const val USER_SERVICE_VERSION = 2
+    private var isBind = false
+    private val USER_SERVICE_ARGS = UserServiceArgs(
+        ComponentName(appCtx.packageName, FileExplorerService::class.java.getName())
+    ).daemon(false).debuggable(BuildConfig.DEBUG).processNameSuffix("file_explorer_service")
+        .version(USER_SERVICE_VERSION)
+    private val SERVICE_CONNECTION: ServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, service: IBinder) {
+            Log.d(TAG, "onServiceConnected: ")
+            isBind = true
+            FileExplorerService.service = IFileExplorerService.Stub.asInterface(service)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName) {
+            Log.d(TAG, "onServiceDisconnected: ")
+            isBind = false
+            FileExplorerService.service = null
+        }
+    }
+
+    fun bindService() {
+        Log.d(TAG, "bindService: isBind = " + isBind)
+        if (!isBind) {
+            Log.e("TAG", "startBindService")
+            Shizuku.bindUserService(USER_SERVICE_ARGS, SERVICE_CONNECTION)
+        }
+    }
+}
