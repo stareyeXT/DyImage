@@ -98,7 +98,9 @@ void GifGetClosestPaletteColor( GifPalette* pPal, int r, int g, int b, int* best
         int r_err = r - ((int32_t)pPal->r[ind]);
         int g_err = g - ((int32_t)pPal->g[ind]);
         int b_err = b - ((int32_t)pPal->b[ind]);
-        int diff = GifIAbs(r_err)+GifIAbs(g_err)+GifIAbs(b_err);
+        // Perceptually-weighted Euclidean distance (ITU-R BT.709 luma weights)
+        // Green is most sensitive to human eyes, blue the least.
+        int diff = (r_err*r_err)*2 + (g_err*g_err)*5 + (b_err*b_err)*1;
 
         if(diff < *bestDiff)
         {
@@ -756,6 +758,7 @@ typedef struct
     FILE* f;
     uint8_t* oldImage;
     bool firstFrame;
+    GifPalette* sharedPalette;  // if non-NULL, reuse this palette for all frames (skip per-frame palette generation)
 
     uint8_t padding[7];    // make padding explicit
 } GifWriter;
@@ -775,6 +778,7 @@ bool GifBegin( GifWriter* writer, const char* filename, uint32_t width, uint32_t
     if(!writer->f) return false;
 
     writer->firstFrame = true;
+    writer->sharedPalette = NULL;
 
     // allocate
     writer->oldImage = (uint8_t*)GIF_MALLOC(width*height*4);
@@ -824,6 +828,7 @@ bool GifBegin( GifWriter* writer, const char* filename, uint32_t width, uint32_t
 // The GIFWriter should have been created by GIFBegin.
 // AFAIK, it is legal to use different bit depths for different frames of an image -
 // this may be handy to save bits in animations that don't change much.
+// If writer->sharedPalette is set, it will be reused for this frame (skips expensive palette generation).
 bool GifWriteFrame( GifWriter* writer, const uint8_t* image, uint32_t width, uint32_t height, uint32_t delay, int bitDepth = 8, bool dither = false )
 {
     if(!writer->f) return false;
@@ -832,7 +837,12 @@ bool GifWriteFrame( GifWriter* writer, const uint8_t* image, uint32_t width, uin
     writer->firstFrame = false;
 
     GifPalette pal;
-    GifMakePalette((dither? NULL : oldImage), image, width, height, bitDepth, dither, &pal);
+    if(writer->sharedPalette) {
+        // Reuse the shared palette — skip GifMakePalette entirely
+        pal = *writer->sharedPalette;
+    } else {
+        GifMakePalette((dither? NULL : oldImage), image, width, height, bitDepth, dither, &pal);
+    }
 
     if(dither)
         GifDitherImage(oldImage, image, writer->oldImage, width, height, &pal);

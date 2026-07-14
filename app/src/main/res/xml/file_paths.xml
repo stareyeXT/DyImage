@@ -3,4 +3,7 @@
     <external-cache-path
         name="image"
         path="image_share/"/>
+    <external-cache-path
+        name="logs"
+        path="logs/"/>
 </paths>

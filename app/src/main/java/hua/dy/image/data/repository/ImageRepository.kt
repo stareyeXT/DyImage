@@ -19,8 +19,10 @@ import hua.dy.image.utils.SharedPreferenceEntrust
 import hua.dy.image.utils.findDocument
 import hua.dy.image.utils.hasDyPermission
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import splitties.init.appCtx
 import java.io.File
 import java.io.InputStream
@@ -232,10 +234,22 @@ object ImageRepository {
         val isAndroidDataPath = scheme.rootPath.contains("/Android/data/") ||
             scheme.rootPath.contains("/Android/obb/")
         val forceShizuku = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isAndroidDataPath
-        val useShizuku = (preferShizuku || forceShizuku) &&
-            hua.dy.image.utils.ShizukuUtils.isShizukuAvailable &&
-            hua.dy.image.utils.ShizukuUtils.isShizukuPermission &&
-            FileExplorerService.service != null
+        val wantShizuku = preferShizuku || forceShizuku
+        val shizukuReady = hua.dy.image.utils.ShizukuUtils.isShizukuAvailable &&
+            hua.dy.image.utils.ShizukuUtils.isShizukuPermission
+
+        // If we want Shizuku but the service isn't bound yet, try to bind it now.
+        if (wantShizuku && shizukuReady && FileExplorerService.service == null) {
+            hua.dy.image.utils.FileExplorerServiceManager.bindService()
+            // Give the binder a moment to connect (max 3 seconds)
+            withTimeoutOrNull(3000) {
+                while (FileExplorerService.service == null) {
+                    delay(100)
+                }
+            }
+        }
+
+        val useShizuku = wantShizuku && shizukuReady && FileExplorerService.service != null
 
         if (useShizuku) {
             scanWithShizuku(scheme, pathConfigs, minSizeBytes)

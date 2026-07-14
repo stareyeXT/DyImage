@@ -1,4 +1,4 @@
-﻿package hua.dy.image.feature.settings
+package hua.dy.image.feature.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
