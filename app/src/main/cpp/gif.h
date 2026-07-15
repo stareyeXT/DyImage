@@ -62,6 +62,11 @@
 
 const int kGifTransIndex = 0;
 
+// 5-5-5 RGB lookup table for O(1) color quantization.
+// Index = (r << 10) | (g << 5) | b, where r,g,b are 5-bit values (0-31).
+// Each entry stores the closest palette index for that 5-bit color.
+uint8_t gifLookupTable[32768];
+
 typedef struct
 {
     int bitDepth;
@@ -132,6 +137,32 @@ void GifGetClosestPaletteColor( GifPalette* pPal, int r, int g, int b, int* best
         if( *bestDiff > splitComp - splitPos )
         {
             GifGetClosestPaletteColor(pPal, r, g, b, bestInd, bestDiff, treeRoot*2);
+        }
+    }
+}
+
+// Builds a direct 5-5-5 RGB lookup table for O(1) palette search.
+// Pre-computes the closest palette color for each of the 32768 (32x32x32)
+// 5-bit RGB combinations. Called whenever the palette changes.
+void GifBuildLookupTable(GifPalette* pPal)
+{
+    for(int r = 0; r < 32; ++r)
+    {
+        int r8 = (r << 3) | (r >> 2);
+        for(int g = 0; g < 32; ++g)
+        {
+            int g8 = (g << 3) | (g >> 2);
+            for(int b = 0; b < 32; ++b)
+            {
+                int b8 = (b << 3) | (b >> 2);
+
+                int bestInd = kGifTransIndex;
+                int bestDiff = 1000000;
+                GifGetClosestPaletteColor(pPal, r8, g8, b8, &bestInd, &bestDiff, 1);
+
+                int idx = (r << 10) | (g << 5) | b;
+                gifLookupTable[idx] = (uint8_t)bestInd;
+            }
         }
     }
 }
@@ -406,7 +437,7 @@ void GifMakePalette( const uint8_t* lastFrame, const uint8_t* nextFrame, uint32_
 }
 
 // Implements Floyd-Steinberg dithering, writes palette value to alpha
-void GifDitherImage( const uint8_t* lastFrame, const uint8_t* nextFrame, uint8_t* outFrame, uint32_t width, uint32_t height, GifPalette* pPal )
+void GifDitherImage( const uint8_t* lastFrame, const uint8_t* nextFrame, uint8_t* outFrame, uint32_t width, uint32_t height, GifPalette* pPal, bool serpentine = true )
 {
     int numPixels = (int)(width * height);
 
@@ -424,83 +455,176 @@ void GifDitherImage( const uint8_t* lastFrame, const uint8_t* nextFrame, uint8_t
 
     for( uint32_t yy=0; yy<height; ++yy )
     {
-        for( uint32_t xx=0; xx<width; ++xx )
+        if( (yy % 2 == 0) || !serpentine )
         {
-            int32_t* nextPix = quantPixels + 4*(yy*width+xx);
-            const uint8_t* lastPix = lastFrame? lastFrame + 4*(yy*width+xx) : NULL;
-
-            // Compute the colors we want (rounding to nearest)
-            int32_t rr = (nextPix[0] + 127) / 256;
-            int32_t gg = (nextPix[1] + 127) / 256;
-            int32_t bb = (nextPix[2] + 127) / 256;
-
-            // if it happens that we want the color from last frame, then just write out
-            // a transparent pixel
-            if( lastFrame &&
-                lastPix[0] == rr &&
-                lastPix[1] == gg &&
-                lastPix[2] == bb )
+            // Left-to-right scan (even rows, or serpentine disabled)
+            for( uint32_t xx=0; xx<width; ++xx )
             {
-                nextPix[0] = rr;
-                nextPix[1] = gg;
-                nextPix[2] = bb;
-                nextPix[3] = kGifTransIndex;
-                continue;
+                int32_t* nextPix = quantPixels + 4*(yy*width+xx);
+                const uint8_t* lastPix = lastFrame? lastFrame + 4*(yy*width+xx) : NULL;
+
+                // Compute the colors we want (rounding to nearest)
+                int32_t rr = (nextPix[0] + 127) / 256;
+                int32_t gg = (nextPix[1] + 127) / 256;
+                int32_t bb = (nextPix[2] + 127) / 256;
+
+                // if it happens that we want the color from last frame, then just write out
+                // a transparent pixel
+                if( lastFrame &&
+                    lastPix[0] == rr &&
+                    lastPix[1] == gg &&
+                    lastPix[2] == bb )
+                {
+                    nextPix[0] = rr;
+                    nextPix[1] = gg;
+                    nextPix[2] = bb;
+                    nextPix[3] = kGifTransIndex;
+                    continue;
+                }
+
+                int32_t bestInd = kGifTransIndex;
+
+                // Look up the closest palette color in the precomputed 5-5-5 lookup table
+                int r5 = GifIMin(GifIMax(rr >> 3, 0), 31);
+                int g5 = GifIMin(GifIMax(gg >> 3, 0), 31);
+                int b5 = GifIMin(GifIMax(bb >> 3, 0), 31);
+                int idx = (r5 << 10) | (g5 << 5) | b5;
+                bestInd = gifLookupTable[idx];
+
+                // Write the result to the temp buffer
+                int32_t r_err = nextPix[0] - (int32_t)(pPal->r[bestInd]) * 256;
+                int32_t g_err = nextPix[1] - (int32_t)(pPal->g[bestInd]) * 256;
+                int32_t b_err = nextPix[2] - (int32_t)(pPal->b[bestInd]) * 256;
+
+                nextPix[0] = pPal->r[bestInd];
+                nextPix[1] = pPal->g[bestInd];
+                nextPix[2] = pPal->b[bestInd];
+                nextPix[3] = bestInd;
+
+                // Propagate the error to the four adjacent locations
+                // that we haven't touched yet
+                int quantloc_7 = (int)(yy * width + xx + 1);
+                int quantloc_3 = (int)(yy * width + width + xx - 1);
+                int quantloc_5 = (int)(yy * width + width + xx);
+                int quantloc_1 = (int)(yy * width + width + xx + 1);
+
+                if(quantloc_7 < numPixels)
+                {
+                    int32_t* pix7 = quantPixels+4*quantloc_7;
+                    pix7[0] += GifIMax( -pix7[0], r_err * 7 / 16 );
+                    pix7[1] += GifIMax( -pix7[1], g_err * 7 / 16 );
+                    pix7[2] += GifIMax( -pix7[2], b_err * 7 / 16 );
+                }
+
+                if(quantloc_3 < numPixels)
+                {
+                    int32_t* pix3 = quantPixels+4*quantloc_3;
+                    pix3[0] += GifIMax( -pix3[0], r_err * 3 / 16 );
+                    pix3[1] += GifIMax( -pix3[1], g_err * 3 / 16 );
+                    pix3[2] += GifIMax( -pix3[2], b_err * 3 / 16 );
+                }
+
+                if(quantloc_5 < numPixels)
+                {
+                    int32_t* pix5 = quantPixels+4*quantloc_5;
+                    pix5[0] += GifIMax( -pix5[0], r_err * 5 / 16 );
+                    pix5[1] += GifIMax( -pix5[1], g_err * 5 / 16 );
+                    pix5[2] += GifIMax( -pix5[2], b_err * 5 / 16 );
+                }
+
+                if(quantloc_1 < numPixels)
+                {
+                    int32_t* pix1 = quantPixels+4*quantloc_1;
+                    pix1[0] += GifIMax( -pix1[0], r_err / 16 );
+                    pix1[1] += GifIMax( -pix1[1], g_err / 16 );
+                    pix1[2] += GifIMax( -pix1[2], b_err / 16 );
+                }
             }
-
-            int32_t bestDiff = 1000000;
-            int32_t bestInd = kGifTransIndex;
-
-            // Search the palete
-            GifGetClosestPaletteColor(pPal, rr, gg, bb, &bestInd, &bestDiff, 1);
-
-            // Write the result to the temp buffer
-            int32_t r_err = nextPix[0] - (int32_t)(pPal->r[bestInd]) * 256;
-            int32_t g_err = nextPix[1] - (int32_t)(pPal->g[bestInd]) * 256;
-            int32_t b_err = nextPix[2] - (int32_t)(pPal->b[bestInd]) * 256;
-
-            nextPix[0] = pPal->r[bestInd];
-            nextPix[1] = pPal->g[bestInd];
-            nextPix[2] = pPal->b[bestInd];
-            nextPix[3] = bestInd;
-
-            // Propagate the error to the four adjacent locations
-            // that we haven't touched yet
-            int quantloc_7 = (int)(yy * width + xx + 1);
-            int quantloc_3 = (int)(yy * width + width + xx - 1);
-            int quantloc_5 = (int)(yy * width + width + xx);
-            int quantloc_1 = (int)(yy * width + width + xx + 1);
-
-            if(quantloc_7 < numPixels)
+        }
+        else
+        {
+            // Right-to-left scan (odd rows, serpentine enabled)
+            for( int32_t xx=(int32_t)(width-1); xx>=0; --xx )
             {
-                int32_t* pix7 = quantPixels+4*quantloc_7;
-                pix7[0] += GifIMax( -pix7[0], r_err * 7 / 16 );
-                pix7[1] += GifIMax( -pix7[1], g_err * 7 / 16 );
-                pix7[2] += GifIMax( -pix7[2], b_err * 7 / 16 );
-            }
+                int32_t* nextPix = quantPixels + 4*(yy*width+xx);
+                const uint8_t* lastPix = lastFrame? lastFrame + 4*(yy*width+xx) : NULL;
 
-            if(quantloc_3 < numPixels)
-            {
-                int32_t* pix3 = quantPixels+4*quantloc_3;
-                pix3[0] += GifIMax( -pix3[0], r_err * 3 / 16 );
-                pix3[1] += GifIMax( -pix3[1], g_err * 3 / 16 );
-                pix3[2] += GifIMax( -pix3[2], b_err * 3 / 16 );
-            }
+                // Compute the colors we want (rounding to nearest)
+                int32_t rr = (nextPix[0] + 127) / 256;
+                int32_t gg = (nextPix[1] + 127) / 256;
+                int32_t bb = (nextPix[2] + 127) / 256;
 
-            if(quantloc_5 < numPixels)
-            {
-                int32_t* pix5 = quantPixels+4*quantloc_5;
-                pix5[0] += GifIMax( -pix5[0], r_err * 5 / 16 );
-                pix5[1] += GifIMax( -pix5[1], g_err * 5 / 16 );
-                pix5[2] += GifIMax( -pix5[2], b_err * 5 / 16 );
-            }
+                // if it happens that we want the color from last frame, then just write out
+                // a transparent pixel
+                if( lastFrame &&
+                    lastPix[0] == rr &&
+                    lastPix[1] == gg &&
+                    lastPix[2] == bb )
+                {
+                    nextPix[0] = rr;
+                    nextPix[1] = gg;
+                    nextPix[2] = bb;
+                    nextPix[3] = kGifTransIndex;
+                    continue;
+                }
 
-            if(quantloc_1 < numPixels)
-            {
-                int32_t* pix1 = quantPixels+4*quantloc_1;
-                pix1[0] += GifIMax( -pix1[0], r_err / 16 );
-                pix1[1] += GifIMax( -pix1[1], g_err / 16 );
-                pix1[2] += GifIMax( -pix1[2], b_err / 16 );
+                int32_t bestInd = kGifTransIndex;
+
+                // Look up the closest palette color in the precomputed 5-5-5 lookup table
+                int r5 = GifIMin(GifIMax(rr >> 3, 0), 31);
+                int g5 = GifIMin(GifIMax(gg >> 3, 0), 31);
+                int b5 = GifIMin(GifIMax(bb >> 3, 0), 31);
+                int idx = (r5 << 10) | (g5 << 5) | b5;
+                bestInd = gifLookupTable[idx];
+
+                // Write the result to the temp buffer
+                int32_t r_err = nextPix[0] - (int32_t)(pPal->r[bestInd]) * 256;
+                int32_t g_err = nextPix[1] - (int32_t)(pPal->g[bestInd]) * 256;
+                int32_t b_err = nextPix[2] - (int32_t)(pPal->b[bestInd]) * 256;
+
+                nextPix[0] = pPal->r[bestInd];
+                nextPix[1] = pPal->g[bestInd];
+                nextPix[2] = pPal->b[bestInd];
+                nextPix[3] = bestInd;
+
+                // Propagate the error to the four adjacent locations
+                // (mirrored for right-to-left scan)
+                int quantloc_7 = (int)(yy * width + xx - 1);   // left neighbor: 7/16
+                int quantloc_3 = (int)(yy * width + width + xx + 1);  // below-right: 3/16
+                int quantloc_5 = (int)(yy * width + width + xx);     // below: 5/16
+                int quantloc_1 = (int)(yy * width + width + xx - 1); // below-left: 1/16
+
+                if(quantloc_7 >= 0 && quantloc_7 < numPixels)
+                {
+                    int32_t* pix7 = quantPixels+4*quantloc_7;
+                    pix7[0] += GifIMax( -pix7[0], r_err * 7 / 16 );
+                    pix7[1] += GifIMax( -pix7[1], g_err * 7 / 16 );
+                    pix7[2] += GifIMax( -pix7[2], b_err * 7 / 16 );
+                }
+
+                if(quantloc_3 < numPixels)
+                {
+                    int32_t* pix3 = quantPixels+4*quantloc_3;
+                    pix3[0] += GifIMax( -pix3[0], r_err * 3 / 16 );
+                    pix3[1] += GifIMax( -pix3[1], g_err * 3 / 16 );
+                    pix3[2] += GifIMax( -pix3[2], b_err * 3 / 16 );
+                }
+
+                if(quantloc_5 < numPixels)
+                {
+                    int32_t* pix5 = quantPixels+4*quantloc_5;
+                    pix5[0] += GifIMax( -pix5[0], r_err * 5 / 16 );
+                    pix5[1] += GifIMax( -pix5[1], g_err * 5 / 16 );
+                    pix5[2] += GifIMax( -pix5[2], b_err * 5 / 16 );
+                }
+
+                if(quantloc_1 < numPixels)
+                {
+                    int32_t* pix1 = quantPixels+4*quantloc_1;
+                    pix1[0] += GifIMax( -pix1[0], r_err / 16 );
+                    pix1[1] += GifIMax( -pix1[1], g_err / 16 );
+                    pix1[2] += GifIMax( -pix1[2], b_err / 16 );
+                }
             }
         }
     }
@@ -535,9 +659,9 @@ void GifThresholdImage( const uint8_t* lastFrame, const uint8_t* nextFrame, uint
         else
         {
             // palettize the pixel
-            int32_t bestDiff = 1000000;
             int32_t bestInd = 1;
-            GifGetClosestPaletteColor(pPal, nextFrame[0], nextFrame[1], nextFrame[2], &bestInd, &bestDiff, 1);
+            int idx = ((nextFrame[0] >> 3) << 10) | ((nextFrame[1] >> 3) << 5) | (nextFrame[2] >> 3);
+            bestInd = gifLookupTable[idx];
 
             // Write the resulting color to the output buffer
             outFrame[0] = pPal->r[bestInd];
@@ -634,14 +758,70 @@ void GifWritePalette( const GifPalette* pPal, FILE* f )
     }
 }
 
+// Computes the bounding box of changed pixels between two RGBA frames (R/G/B only, alpha ignored).
+// Uses coarse-to-fine: 4x4 blocks then pixel-level refinement.
+// Returns false if frames are identical (empty rect). true with bounds on change.
+bool GifComputeDiffRect(const uint8_t* prev, const uint8_t* curr,
+                        int width, int height,
+                        int* left, int* top, int* right, int* bottom)
+{
+    int minX = width, minY = height, maxX = 0, maxY = 0;
+
+    // Coarse scan in 4x4 blocks
+    for (int yy = 0; yy < height; yy += 4) {
+        for (int xx = 0; xx < width; xx += 4) {
+            // Check if any pixel in this 4x4 block differs
+            bool blockChanged = false;
+            for (int dy = 0; dy < 4 && yy + dy < height && !blockChanged; ++dy) {
+                for (int dx = 0; dx < 4 && xx + dx < width; ++dx) {
+                    int idx = ((yy + dy) * width + (xx + dx)) * 4;
+                    if (prev[idx] != curr[idx] ||
+                        prev[idx+1] != curr[idx+1] ||
+                        prev[idx+2] != curr[idx+2]) {
+                        blockChanged = true;
+                        break;
+                    }
+                }
+            }
+            if (blockChanged) {
+                // Refine to pixel-level precision within this block
+                for (int dy = 0; dy < 4 && yy + dy < height; ++dy) {
+                    for (int dx = 0; dx < 4 && xx + dx < width; ++dx) {
+                        int px = xx + dx, py = yy + dy;
+                        int idx = (py * width + px) * 4;
+                        if (prev[idx] != curr[idx] ||
+                            prev[idx+1] != curr[idx+1] ||
+                            prev[idx+2] != curr[idx+2]) {
+                            if (px < minX) minX = px;
+                            if (px > maxX) maxX = px;
+                            if (py < minY) minY = py;
+                            if (py > maxY) maxY = py;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (minX > maxX || minY > maxY) {
+        return false; // No change detected
+    }
+
+    *left = minX;
+    *top = minY;
+    *right = maxX + 1;  // exclusive
+    *bottom = maxY + 1; // exclusive
+    return true;
+}
+
 // write the image header, LZW-compress and write out the image
-void GifWriteLzwImage(FILE* f, uint8_t* image, uint32_t left, uint32_t top,  uint32_t width, uint32_t height, uint32_t delay, GifPalette* pPal)
+void GifWriteLzwImage(FILE* f, uint8_t* image, uint32_t left, uint32_t top,  uint32_t width, uint32_t height, uint32_t delay, GifPalette* pPal, int disposalMethod = 1)
 {
     // graphics control extension
     fputc(0x21, f);
     fputc(0xf9, f);
     fputc(0x04, f);
-    fputc(0x05, f); // leave prev frame in place, this frame has transparency
+    fputc(0x01 | ((disposalMethod & 7) << 2), f); // bit0=transparency, bits2-4=disposal method
     fputc(delay & 0xff, f);
     fputc((delay >> 8) & 0xff, f);
     fputc(kGifTransIndex, f); // transparent color index
@@ -760,7 +940,8 @@ typedef struct
     bool firstFrame;
     GifPalette* sharedPalette;  // if non-NULL, reuse this palette for all frames (skip per-frame palette generation)
 
-    uint8_t padding[7];    // make padding explicit
+    uint32_t canvasWidth;  // canvas width, needed for partial frame offset math
+    uint8_t padding[3];    // make padding explicit
 } GifWriter;
 
 // Creates a gif file.
@@ -779,6 +960,7 @@ bool GifBegin( GifWriter* writer, const char* filename, uint32_t width, uint32_t
 
     writer->firstFrame = true;
     writer->sharedPalette = NULL;
+    writer->canvasWidth = width;
 
     // allocate
     writer->oldImage = (uint8_t*)GIF_MALLOC(width*height*4);
@@ -829,7 +1011,9 @@ bool GifBegin( GifWriter* writer, const char* filename, uint32_t width, uint32_t
 // AFAIK, it is legal to use different bit depths for different frames of an image -
 // this may be handy to save bits in animations that don't change much.
 // If writer->sharedPalette is set, it will be reused for this frame (skips expensive palette generation).
-bool GifWriteFrame( GifWriter* writer, const uint8_t* image, uint32_t width, uint32_t height, uint32_t delay, int bitDepth = 8, bool dither = false )
+// left/top specify the sub-region position in the canvas; use 0,0 for full-frame.
+// disposalMethod: 1=don't dispose (default), 2=restore to bg, 3=restore to previous.
+bool GifWriteFrame( GifWriter* writer, const uint8_t* image, uint32_t width, uint32_t height, uint32_t delay, int bitDepth = 8, bool dither = false, int left = 0, int top = 0, int disposalMethod = 1 )
 {
     if(!writer->f) return false;
 
@@ -844,12 +1028,63 @@ bool GifWriteFrame( GifWriter* writer, const uint8_t* image, uint32_t width, uin
         GifMakePalette((dither? NULL : oldImage), image, width, height, bitDepth, dither, &pal);
     }
 
-    if(dither)
-        GifDitherImage(oldImage, image, writer->oldImage, width, height, &pal);
-    else
-        GifThresholdImage(oldImage, image, writer->oldImage, width, height, &pal);
+    // Build the 5-5-5 lookup table for O(1) palette color matching
+    GifBuildLookupTable(&pal);
 
-    GifWriteLzwImage(writer->f, writer->oldImage, 0, 0, width, height, delay, &pal);
+    // Check if this is a partial frame (sub-region of the canvas)
+    bool isPartial = (left != 0 || top != 0 || width != writer->canvasWidth);
+
+    if (isPartial) {
+        // Partial frame: extract sub-region, dither, write as sub-image,
+        // then copy dithered output back to oldImage for next-frame delta encoding.
+
+        // Allocate output for the dithered sub-region
+        uint8_t* subOutput = (uint8_t*)GIF_TEMP_MALLOC((size_t)width * height * 4);
+        if (!subOutput) return false;
+
+        // Pointer to the corresponding region in oldImage (or NULL if first frame)
+        const uint8_t* subOld = oldImage ? oldImage + ((size_t)top * writer->canvasWidth + left) * 4 : NULL;
+
+        // Extract current frame sub-region from the full canvas image
+        uint8_t* subCurrent = (uint8_t*)GIF_TEMP_MALLOC((size_t)width * height * 4);
+        if (!subCurrent) {
+            GIF_TEMP_FREE(subOutput);
+            return false;
+        }
+        for (uint32_t yy = 0; yy < height; ++yy) {
+            memcpy(subCurrent + yy * width * 4,
+                   image + ((size_t)(top + yy) * writer->canvasWidth + left) * 4,
+                   width * 4);
+        }
+
+        if (dither)
+            GifDitherImage(subOld, subCurrent, subOutput, width, height, &pal, true);
+        else
+            GifThresholdImage(subOld, subCurrent, subOutput, width, height, &pal);
+
+        GIF_TEMP_FREE(subCurrent);
+
+        // Write the sub-region as a GIF image block with disposal method
+        GifWriteLzwImage(writer->f, subOutput, (uint32_t)left, (uint32_t)top, width, height, delay, &pal, disposalMethod);
+
+        // Copy the dithered output back into writer->oldImage at the correct position,
+        // so the next frame's delta-encoding comparison produces correct results.
+        for (uint32_t yy = 0; yy < height; ++yy) {
+            memcpy(writer->oldImage + ((size_t)(top + yy) * writer->canvasWidth + left) * 4,
+                   subOutput + yy * width * 4,
+                   width * 4);
+        }
+
+        GIF_TEMP_FREE(subOutput);
+    } else {
+        // Full frame, original code path
+        if(dither)
+            GifDitherImage(oldImage, image, writer->oldImage, width, height, &pal, true);
+        else
+            GifThresholdImage(oldImage, image, writer->oldImage, width, height, &pal);
+
+        GifWriteLzwImage(writer->f, writer->oldImage, 0, 0, width, height, delay, &pal, disposalMethod);
+    }
 
     return true;
 }

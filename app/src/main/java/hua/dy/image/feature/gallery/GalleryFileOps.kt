@@ -8,6 +8,9 @@ import hua.dy.image.utils.FileType
 import hua.dy.image.utils.X2GifUtils
 import splitties.init.appCtx
 import java.io.File
+import java.io.FileInputStream
+import java.math.BigInteger
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -19,10 +22,66 @@ internal fun isGifConvertible(path: String, fileType: FileType? = null): Boolean
     return fileType == FileType.WEBP || fileType == FileType.HEIC
 }
 
+// ---- GIF 缓存 ----
+
+private val gifCacheDir: File by lazy {
+    File(appCtx.externalCacheDir ?: appCtx.cacheDir, "image_share/gif_cache")
+        .also { if (!it.exists()) it.mkdirs() }
+        // 首次访问时清理超过 7 天的旧缓存文件
+        .also { dir -> cleanupOldCache(dir) }
+}
+
+/** 清理超过 maxAgeDays 天的缓存文件 */
+private fun cleanupOldCache(dir: File, maxAgeDays: Long = 7) {
+    val deadline = System.currentTimeMillis() - maxAgeDays * 24 * 60 * 60 * 1000
+    dir.listFiles()?.forEach { file ->
+        if (file.lastModified() < deadline) file.delete()
+    }
+}
+
+private fun computeFileMd5(file: File): String? = runCatching {
+    MessageDigest.getInstance("MD5").let { md ->
+        FileInputStream(file).use { input ->
+            val buf = ByteArray(8192)
+            var read: Int
+            while (input.read(buf).also { read = it } != -1) {
+                md.update(buf, 0, read)
+            }
+        }
+        BigInteger(1, md.digest()).toString(16).padStart(32, '0')
+    }
+}.getOrNull()
+
+private fun getCachedGif(sourcePath: String): String? {
+    val source = File(sourcePath)
+    if (!source.exists()) return null
+    val md5 = computeFileMd5(source) ?: return null
+    val cached = File(gifCacheDir, "$md5.gif")
+    return if (cached.exists()) cached.absolutePath else null
+}
+
+private fun cacheGif(sourcePath: String, gifPath: String): String? {
+    val md5 = computeFileMd5(File(sourcePath)) ?: return null
+    val cached = File(gifCacheDir, "$md5.gif")
+    if (!cached.exists()) {
+        // 移动（renameTo）而非复制，省掉一次 I/O
+        if (!File(gifPath).renameTo(cached)) return null
+    } else {
+        // 缓存已存在（并发场景），删除刚生成的文件
+        File(gifPath).delete()
+    }
+    return cached.absolutePath
+}
+
+// ----------
+
 internal fun convertToGif(sourcePath: String, nameSeed: String): String? {
     if (!isGifConvertible(sourcePath)) return null
     val source = File(sourcePath)
     if (!source.exists()) return null
+
+    // 1) 命中缓存则直接返回
+    getCachedGif(sourcePath)?.let { return it }
 
     val baseDir = appCtx.externalCacheDir ?: appCtx.cacheDir
     val outputDir = File(baseDir, "image_share/converted_gif")
@@ -35,7 +94,9 @@ internal fun convertToGif(sourcePath: String, nameSeed: String): String? {
         if (target.exists()) target.delete()
         return null
     }
-    return target.absolutePath
+
+    // 2) 写入缓存（文件被 renameTo 到缓存目录）
+    return cacheGif(sourcePath, target.absolutePath) ?: target.absolutePath
 }
 
 internal fun saveImageToLocal(path: String): Boolean {

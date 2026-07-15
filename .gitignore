@@ -16,3 +16,5 @@
 local.properties
 /sign.properties
 debug.keystore
+.omo/run-continuation/
+

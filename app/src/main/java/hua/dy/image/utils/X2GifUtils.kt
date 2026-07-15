@@ -22,16 +22,16 @@ object X2GifUtils {
 
     /**
      * FFmpeg 2-pass conversion:
-     * Pass 1: Generate optimized palette
-     * Pass 2: Encode GIF using the palette with high-quality dithering
+     * Pass 1: Generate optimized palette using ALL frames' pixels
+     * Pass 2: Encode GIF using error-diffusion dithering for maximum quality
      */
     private fun convertWithPalette(rawPath: String, gifPath: String): Boolean {
         val palettePath = gifPath + ".palette.png"
 
         // Pass 1: Generate optimized palette
-        // stats_mode=diff: generate palette based on frame differences (better for animations)
+        // stats_mode=full: consider ALL pixels (not just changed pixels) → 更准确的色表
         // reserve_transparent=0: don't reserve a palette entry for transparency
-        val paletteCmd = "-y -i \"$rawPath\" -vf \"palettegen=stats_mode=diff:reserve_transparent=0\" \"$palettePath\""
+        val paletteCmd = "-y -i \"$rawPath\" -vf \"palettegen=stats_mode=full:reserve_transparent=0\" \"$palettePath\""
         Log.d(TAG, "Pass 1: Generating palette")
         val paletteSession = FFmpegKit.execute(paletteCmd)
 
@@ -41,10 +41,11 @@ object X2GifUtils {
         }
 
         // Pass 2: Encode GIF using the palette
-        // dither=bayer:bayer_scale=5: Bayer dithering (fast, low noise)
-        // diff_mode=rectangle: only update changed regions (smaller file)
-        // loop 0: infinite loop
-        val encodeCmd = "-y -i \"$rawPath\" -i \"$palettePath\" -lavfi \"paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle\" -loop 0 \"$gifPath\""
+        // dither=atkinson: Atkinson 误差扩散抖动，只传播 3/4 误差 → 比 Floyd-Steinberg
+        // 更干净，孤立的噪点/像素点少得多，同时保留平滑过渡
+        // 不使用 diff_mode=rectangle，避免矩形边界跳变导致的网格感
+        // loop 0: 无限循环
+        val encodeCmd = "-y -i \"$rawPath\" -i \"$palettePath\" -lavfi \"paletteuse=dither=atkinson\" -loop 0 \"$gifPath\""
         Log.d(TAG, "Pass 2: Encoding GIF")
         val encodeSession = FFmpegKit.execute(encodeCmd)
 
